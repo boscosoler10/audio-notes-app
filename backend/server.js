@@ -315,157 +315,269 @@ app.post('/api/ai-summarize', async (req, res) => {
   }
 });
 
-// Summarization Algorithm
+// Summarization Algorithm - improved for live transcription
 function generateSummary(text) {
   if (!text || text.trim().length === 0) {
     return { keyPoints: [], summary: '', actionItems: [] };
   }
 
-  // Split text into sentences
-  const sentences = text
-    .replace(/([.!?])\s+/g, '$1|')
-    .split('|')
+  // Clean and normalize text
+  const cleanText = text.trim();
+  const words = cleanText.split(/\s+/);
+  const wordCount = words.length;
+
+  // Split into segments (handle both punctuated and unpunctuated text)
+  let segments = [];
+
+  // First try splitting by punctuation
+  const punctuatedSegments = cleanText
+    .split(/[.!?]+/)
     .map(s => s.trim())
-    .filter(s => s.length > 10);
+    .filter(s => s.length > 15);
 
-  // Extract key points (sentences with important indicators)
-  const importanceIndicators = [
-    'important', 'key', 'main', 'critical', 'essential', 'must', 'should',
-    'need', 'require', 'deadline', 'priority', 'focus', 'goal', 'objective',
-    'remember', 'note', 'action', 'task', 'decision', 'conclusion'
-  ];
-
-  const keyPoints = [];
-  const actionItems = [];
-  const regularPoints = [];
-
-  sentences.forEach(sentence => {
-    const lowerSentence = sentence.toLowerCase();
-
-    // Check for action items
-    if (
-      lowerSentence.includes('need to') ||
-      lowerSentence.includes('have to') ||
-      lowerSentence.includes('must') ||
-      lowerSentence.includes('should') ||
-      lowerSentence.includes('will') ||
-      lowerSentence.includes('action') ||
-      lowerSentence.includes('todo') ||
-      lowerSentence.includes('task')
-    ) {
-      actionItems.push(sentence);
-    }
-
-    // Check for key points
-    const hasImportance = importanceIndicators.some(indicator =>
-      lowerSentence.includes(indicator)
-    );
-
-    if (hasImportance) {
-      keyPoints.push(sentence);
-    } else {
-      regularPoints.push(sentence);
-    }
-  });
-
-  // Create a condensed summary
-  const summaryPoints = [...keyPoints.slice(0, 5)];
-
-  // Add some regular points if we don't have enough key points
-  if (summaryPoints.length < 5) {
-    const remaining = 5 - summaryPoints.length;
-    // Pick sentences spread throughout the text
-    const step = Math.max(1, Math.floor(regularPoints.length / remaining));
-    for (let i = 0; i < regularPoints.length && summaryPoints.length < 5; i += step) {
-      summaryPoints.push(regularPoints[i]);
+  if (punctuatedSegments.length >= 3) {
+    segments = punctuatedSegments;
+  } else {
+    // For unpunctuated text, split by word chunks or natural pauses
+    // Split into chunks of roughly 15-25 words
+    const chunkSize = 20;
+    for (let i = 0; i < words.length; i += chunkSize) {
+      const chunk = words.slice(i, Math.min(i + chunkSize, words.length)).join(' ');
+      if (chunk.length > 15) {
+        segments.push(chunk);
+      }
     }
   }
 
-  // Generate summary paragraph
-  const summaryParagraph = summaryPoints.length > 0
-    ? summaryPoints.join(' ')
-    : text.substring(0, 500) + (text.length > 500 ? '...' : '');
+  // Keywords for categorization
+  const actionKeywords = ['need', 'must', 'should', 'have to', 'going to', 'will', 'plan', 'todo', 'task', 'action', 'deadline', 'complete', 'finish', 'start', 'begin', 'make sure', 'don\'t forget', 'remember to'];
+  const importantKeywords = ['important', 'key', 'main', 'critical', 'essential', 'priority', 'focus', 'goal', 'objective', 'significant', 'crucial', 'note that', 'keep in mind', 'basically', 'essentially', 'the point is', 'in summary', 'to summarize', 'conclusion', 'decided', 'agreed'];
+
+  const keyPoints = [];
+  const actionItems = [];
+  const topicSentences = [];
+
+  segments.forEach((segment, index) => {
+    const lowerSegment = segment.toLowerCase();
+
+    // Check for action items
+    const isAction = actionKeywords.some(kw => lowerSegment.includes(kw));
+    if (isAction) {
+      actionItems.push(segment);
+    }
+
+    // Check for important points
+    const isImportant = importantKeywords.some(kw => lowerSegment.includes(kw));
+    if (isImportant) {
+      keyPoints.push(segment);
+    }
+
+    // First segment often introduces the topic
+    if (index === 0 && segment.length > 20) {
+      topicSentences.push(segment);
+    }
+  });
+
+  // If no key points found, extract the most informative segments
+  if (keyPoints.length === 0 && segments.length > 0) {
+    // Take first, middle, and last segments as representative
+    keyPoints.push(segments[0]);
+    if (segments.length > 2) {
+      keyPoints.push(segments[Math.floor(segments.length / 2)]);
+    }
+    if (segments.length > 1) {
+      keyPoints.push(segments[segments.length - 1]);
+    }
+  }
+
+  // Generate a condensed summary
+  let summary = '';
+  const targetSummaryLength = Math.min(150, Math.floor(wordCount * 0.3)); // ~30% of original or 150 words max
+
+  // Build summary from key points and topic sentences
+  const summarySource = [...new Set([...topicSentences, ...keyPoints.slice(0, 3)])];
+
+  if (summarySource.length > 0) {
+    let summaryWords = [];
+    for (const segment of summarySource) {
+      const segmentWords = segment.split(/\s+/);
+      if (summaryWords.length + segmentWords.length <= targetSummaryLength) {
+        summaryWords = summaryWords.concat(segmentWords);
+      } else {
+        // Add partial segment to reach target
+        const remaining = targetSummaryLength - summaryWords.length;
+        if (remaining > 5) {
+          summaryWords = summaryWords.concat(segmentWords.slice(0, remaining));
+        }
+        break;
+      }
+    }
+    summary = summaryWords.join(' ');
+    if (summary.length > 0 && !summary.match(/[.!?]$/)) {
+      summary += '.';
+    }
+  } else {
+    // Fallback: take first portion of text
+    summary = words.slice(0, Math.min(targetSummaryLength, words.length)).join(' ');
+    if (!summary.match(/[.!?]$/)) {
+      summary += '...';
+    }
+  }
+
+  // Deduplicate and limit results
+  const uniqueKeyPoints = [...new Set(keyPoints)].slice(0, 5);
+  const uniqueActionItems = [...new Set(actionItems)].slice(0, 5);
 
   return {
-    keyPoints: keyPoints.slice(0, 10),
-    summary: summaryParagraph,
-    actionItems: actionItems.slice(0, 10),
-    wordCount: text.split(/\s+/).length,
-    sentenceCount: sentences.length
+    keyPoints: uniqueKeyPoints,
+    summary: summary,
+    actionItems: uniqueActionItems,
+    wordCount: wordCount,
+    sentenceCount: segments.length,
+    compressionRatio: summary.split(/\s+/).length / wordCount
   };
 }
 
-// Note Enhancement Algorithm
+// Note Enhancement Algorithm - improved for better results
 function enhanceNotes(existingNotes, transcription) {
+  // Parse existing notes
   const existingLines = existingNotes
     .split('\n')
     .map(line => line.trim())
     .filter(line => line.length > 0);
 
+  // Generate summary of transcription
   const transcriptionSummary = generateSummary(transcription);
 
-  // Find topics mentioned in existing notes
+  // Extract key topics/words from existing notes (excluding common words)
+  const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because', 'until', 'while', 'this', 'that', 'these', 'those', 'what', 'which', 'who', 'whom', 'its', 'your', 'their', 'our', 'his', 'her']);
+
   const existingTopics = new Set();
   existingLines.forEach(line => {
-    const words = line.toLowerCase().split(/\s+/);
+    const words = line.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
     words.forEach(word => {
-      if (word.length > 4) {
+      if (word.length > 3 && !stopWords.has(word)) {
         existingTopics.add(word);
       }
     });
   });
 
-  // Find new information from transcription that relates to existing topics
-  const newInformation = [];
-  const transcriptionSentences = transcription
-    .replace(/([.!?])\s+/g, '$1|')
-    .split('|')
+  // Split transcription into segments
+  let transcriptionSegments = [];
+  const cleanTranscription = transcription.trim();
+
+  // Try punctuation-based splitting first
+  const punctuatedSegments = cleanTranscription
+    .split(/[.!?]+/)
     .map(s => s.trim())
     .filter(s => s.length > 10);
 
-  transcriptionSentences.forEach(sentence => {
-    const sentenceWords = sentence.toLowerCase().split(/\s+/);
-    const hasRelatedTopic = sentenceWords.some(word => existingTopics.has(word));
+  if (punctuatedSegments.length >= 2) {
+    transcriptionSegments = punctuatedSegments;
+  } else {
+    // Split by word chunks for unpunctuated text
+    const words = cleanTranscription.split(/\s+/);
+    const chunkSize = 25;
+    for (let i = 0; i < words.length; i += chunkSize) {
+      const chunk = words.slice(i, Math.min(i + chunkSize, words.length)).join(' ');
+      if (chunk.length > 10) {
+        transcriptionSegments.push(chunk);
+      }
+    }
+  }
 
-    if (hasRelatedTopic) {
-      // Check if this information is not already in notes
+  // Find new information related to existing topics
+  const newInformation = [];
+  const usedSegments = new Set();
+
+  transcriptionSegments.forEach(segment => {
+    const segmentWords = segment.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
+    const matchingTopics = segmentWords.filter(word => existingTopics.has(word));
+
+    // If segment relates to existing topics
+    if (matchingTopics.length >= 1) {
+      // Check if this is substantially different from existing notes
       const isDuplicate = existingLines.some(line => {
-        const similarity = calculateSimilarity(line.toLowerCase(), sentence.toLowerCase());
-        return similarity > 0.6;
+        const similarity = calculateSimilarity(line.toLowerCase(), segment.toLowerCase());
+        return similarity > 0.5;
       });
 
-      if (!isDuplicate) {
-        newInformation.push(sentence);
+      if (!isDuplicate && !usedSegments.has(segment)) {
+        newInformation.push(segment);
+        usedSegments.add(segment);
       }
     }
   });
 
-  // Build enhanced notes
-  let enhancedNotes = '# Enhanced Notes\n\n';
-  enhancedNotes += '## Original Notes\n';
-  enhancedNotes += existingLines.map(line => `- ${line}`).join('\n');
-  enhancedNotes += '\n\n';
+  // Also include segments that might be new topics not in original notes
+  const additionalInfo = [];
+  transcriptionSegments.forEach(segment => {
+    if (!usedSegments.has(segment)) {
+      const isDuplicate = existingLines.some(line => {
+        const similarity = calculateSimilarity(line.toLowerCase(), segment.toLowerCase());
+        return similarity > 0.4;
+      });
+      if (!isDuplicate) {
+        additionalInfo.push(segment);
+        usedSegments.add(segment);
+      }
+    }
+  });
 
+  // Build enhanced notes document
+  let enhancedNotes = '# Enhanced Notes\n\n';
+
+  // Original notes section
+  enhancedNotes += '## Original Notes\n';
+  existingLines.forEach(line => {
+    // Preserve original formatting if it looks like a list item
+    if (line.startsWith('-') || line.startsWith('*') || line.match(/^\d+\./)) {
+      enhancedNotes += line + '\n';
+    } else {
+      enhancedNotes += '- ' + line + '\n';
+    }
+  });
+  enhancedNotes += '\n';
+
+  // Related information from recording
   if (newInformation.length > 0) {
-    enhancedNotes += '## Additional Information from Recording\n';
-    enhancedNotes += newInformation.slice(0, 10).map(info => `- ${info}`).join('\n');
-    enhancedNotes += '\n\n';
+    enhancedNotes += '## Related Details from Recording\n';
+    newInformation.slice(0, 8).forEach(info => {
+      enhancedNotes += '- ' + info + '\n';
+    });
+    enhancedNotes += '\n';
   }
 
+  // Additional new information
+  if (additionalInfo.length > 0) {
+    enhancedNotes += '## Additional Information\n';
+    additionalInfo.slice(0, 5).forEach(info => {
+      enhancedNotes += '- ' + info + '\n';
+    });
+    enhancedNotes += '\n';
+  }
+
+  // Key points from transcription
   if (transcriptionSummary.keyPoints.length > 0) {
     enhancedNotes += '## Key Points\n';
-    enhancedNotes += transcriptionSummary.keyPoints.map(point => `- ${point}`).join('\n');
-    enhancedNotes += '\n\n';
+    transcriptionSummary.keyPoints.forEach(point => {
+      enhancedNotes += '- ' + point + '\n';
+    });
+    enhancedNotes += '\n';
   }
 
+  // Action items
   if (transcriptionSummary.actionItems.length > 0) {
     enhancedNotes += '## Action Items\n';
-    enhancedNotes += transcriptionSummary.actionItems.map(item => `- [ ] ${item}`).join('\n');
-    enhancedNotes += '\n\n';
+    transcriptionSummary.actionItems.forEach(item => {
+      enhancedNotes += '- [ ] ' + item + '\n';
+    });
+    enhancedNotes += '\n';
   }
 
+  // Summary
   enhancedNotes += '## Summary\n';
-  enhancedNotes += transcriptionSummary.summary;
+  enhancedNotes += transcriptionSummary.summary + '\n';
 
   return enhancedNotes;
 }

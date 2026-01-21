@@ -10,12 +10,15 @@ function NotesEnhancer({ currentTranscript, onNotification }) {
 
   const fileInputRef = useRef(null);
 
-  // Use current transcript from recording if available
+  // Update transcription text when recording transcript changes
+  // Only auto-update if user hasn't manually edited the text
+  const [hasManualEdit, setHasManualEdit] = useState(false);
+
   React.useEffect(() => {
-    if (currentTranscript && !transcriptionText) {
+    if (currentTranscript && !hasManualEdit) {
       setTranscriptionText(currentTranscript);
     }
-  }, [currentTranscript]);
+  }, [currentTranscript, hasManualEdit]);
 
   const handleFileUpload = useCallback(async (file) => {
     if (!file) return;
@@ -139,6 +142,7 @@ function NotesEnhancer({ currentTranscript, onNotification }) {
   const handleUseRecordingTranscript = useCallback(() => {
     if (currentTranscript) {
       setTranscriptionText(currentTranscript);
+      setHasManualEdit(false);
       onNotification('Using transcript from recording', 'info');
     } else {
       onNotification('No transcript available from recording', 'error');
@@ -211,7 +215,10 @@ function NotesEnhancer({ currentTranscript, onNotification }) {
             className="notes-editor"
             placeholder="Paste transcription text here, or use the recording transcript..."
             value={transcriptionText}
-            onChange={(e) => setTranscriptionText(e.target.value)}
+            onChange={(e) => {
+              setTranscriptionText(e.target.value);
+              setHasManualEdit(true);
+            }}
           />
 
           <div className="control-buttons" style={{ marginTop: '1rem' }}>
