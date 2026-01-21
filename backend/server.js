@@ -56,8 +56,9 @@ wss.on('connection', async (clientWs) => {
 
   let assemblyWs = null;
   let sessionId = Date.now().toString();
-  let fullTranscript = '';
-  let lastTranscript = '';
+  let fullTranscript = '';           // Accumulated transcript across all turns
+  let currentTurnText = '';          // Current turn's partial text
+  let lastCompletedTurn = -1;        // Track which turns we've already processed
 
   try {
     // Connect to AssemblyAI Universal Streaming v3 API
@@ -90,26 +91,36 @@ wss.on('connection', async (clientWs) => {
 
           case 'Turn':
             // Handle turn messages (transcription updates)
-            if (data.transcript) {
-              if (data.end_of_turn) {
-                // End of turn - this is a finalized segment
-                const newText = data.transcript;
-                if (newText !== lastTranscript) {
-                  fullTranscript = newText;
-                  lastTranscript = newText;
-                  clientWs.send(JSON.stringify({
-                    type: 'final_transcript',
-                    text: data.utterance || newText,
-                    fullTranscript: fullTranscript.trim()
-                  }));
+            const turnOrder = data.turn_order || 0;
+
+            if (data.end_of_turn && turnOrder > lastCompletedTurn) {
+              // End of turn - append this turn's utterance to full transcript
+              lastCompletedTurn = turnOrder;
+              const turnText = data.utterance || data.transcript || '';
+
+              if (turnText.trim()) {
+                // Append to full transcript with proper spacing
+                if (fullTranscript) {
+                  fullTranscript += ' ' + turnText.trim();
+                } else {
+                  fullTranscript = turnText.trim();
                 }
-              } else {
-                // Partial transcript (still being spoken)
+
+                currentTurnText = '';
+
                 clientWs.send(JSON.stringify({
-                  type: 'partial_transcript',
-                  text: data.transcript
+                  type: 'final_transcript',
+                  text: turnText.trim(),
+                  fullTranscript: fullTranscript
                 }));
               }
+            } else if (!data.end_of_turn && data.transcript) {
+              // Partial transcript (still being spoken in current turn)
+              currentTurnText = data.transcript;
+              clientWs.send(JSON.stringify({
+                type: 'partial_transcript',
+                text: currentTurnText
+              }));
             }
             break;
 
