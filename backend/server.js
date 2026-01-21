@@ -56,9 +56,18 @@ wss.on('connection', async (clientWs) => {
 
   let assemblyWs = null;
   let sessionId = Date.now().toString();
-  let fullTranscript = '';           // Accumulated transcript across all turns
-  let currentTurnText = '';          // Current turn's partial text
-  let lastCompletedTurn = -1;        // Track which turns we've already processed
+
+  // Transcript management - store all completed turns
+  const completedTurns = new Map(); // turn_order -> utterance text
+  let currentPartialText = '';
+
+  // Function to build full transcript from all completed turns
+  const buildFullTranscript = () => {
+    const sortedTurns = Array.from(completedTurns.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([_, text]) => text);
+    return sortedTurns.join(' ').trim();
+  };
 
   try {
     // Connect to AssemblyAI Universal Streaming v3 API
@@ -78,9 +87,13 @@ wss.on('connection', async (clientWs) => {
       try {
         const data = JSON.parse(message.toString());
 
+        // Log for debugging
+        if (data.type === 'Turn') {
+          console.log(`Turn ${data.turn_order}: end_of_turn=${data.end_of_turn}, transcript length=${data.transcript?.length || 0}`);
+        }
+
         switch (data.type) {
           case 'Begin':
-            // Session started
             console.log('AssemblyAI session started:', data.id);
             sessionId = data.id;
             clientWs.send(JSON.stringify({
@@ -90,51 +103,50 @@ wss.on('connection', async (clientWs) => {
             break;
 
           case 'Turn':
-            // Handle turn messages (transcription updates)
-            const turnOrder = data.turn_order || 0;
+            const turnOrder = data.turn_order ?? 0;
 
-            if (data.end_of_turn && turnOrder > lastCompletedTurn) {
-              // End of turn - append this turn's utterance to full transcript
-              lastCompletedTurn = turnOrder;
-              const turnText = data.utterance || data.transcript || '';
+            if (data.end_of_turn) {
+              // Turn completed - store the utterance or transcript
+              const turnText = (data.utterance || data.transcript || '').trim();
 
-              if (turnText.trim()) {
-                // Append to full transcript with proper spacing
-                if (fullTranscript) {
-                  fullTranscript += ' ' + turnText.trim();
-                } else {
-                  fullTranscript = turnText.trim();
-                }
+              if (turnText && !completedTurns.has(turnOrder)) {
+                completedTurns.set(turnOrder, turnText);
+                currentPartialText = '';
 
-                currentTurnText = '';
+                const fullTranscript = buildFullTranscript();
+
+                console.log(`Completed turn ${turnOrder}: "${turnText.substring(0, 50)}..."`);
+                console.log(`Full transcript now: ${fullTranscript.length} chars`);
 
                 clientWs.send(JSON.stringify({
                   type: 'final_transcript',
-                  text: turnText.trim(),
+                  text: turnText,
                   fullTranscript: fullTranscript
                 }));
               }
-            } else if (!data.end_of_turn && data.transcript) {
-              // Partial transcript (still being spoken in current turn)
-              currentTurnText = data.transcript;
+            } else if (data.transcript) {
+              // Partial transcript - show current progress
+              currentPartialText = data.transcript;
               clientWs.send(JSON.stringify({
                 type: 'partial_transcript',
-                text: currentTurnText
+                text: currentPartialText
               }));
             }
             break;
 
           case 'Termination':
-            // Session ended
             console.log('AssemblyAI session terminated');
+            const finalTranscript = buildFullTranscript();
+            console.log(`Final transcript: ${finalTranscript.length} chars, ${completedTurns.size} turns`);
+
             clientWs.send(JSON.stringify({
               type: 'session_end',
-              fullTranscript: fullTranscript.trim()
+              fullTranscript: finalTranscript
             }));
             break;
 
           default:
-            console.log('Unknown message type from AssemblyAI:', data.type);
+            console.log('Unknown message type:', data.type, data);
         }
       } catch (error) {
         console.error('Error parsing AssemblyAI message:', error);
@@ -154,12 +166,12 @@ wss.on('connection', async (clientWs) => {
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify({
           type: 'session_end',
-          fullTranscript: fullTranscript.trim()
+          fullTranscript: buildFullTranscript()
         }));
       }
     });
 
-    activeSessions.set(sessionId, { ws: assemblyWs, transcript: '' });
+    activeSessions.set(sessionId, { ws: assemblyWs });
 
   } catch (error) {
     console.error('Failed to connect to AssemblyAI:', error);
@@ -175,7 +187,6 @@ wss.on('connection', async (clientWs) => {
   clientWs.on('message', (data) => {
     if (assemblyWs && assemblyWs.readyState === WebSocket.OPEN) {
       try {
-        // Send binary audio data directly to AssemblyAI
         const audioBuffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
         assemblyWs.send(audioBuffer);
       } catch (error) {
@@ -189,7 +200,6 @@ wss.on('connection', async (clientWs) => {
     console.log('Client disconnected');
     if (assemblyWs && assemblyWs.readyState === WebSocket.OPEN) {
       try {
-        // Send termination message to AssemblyAI
         assemblyWs.send(JSON.stringify({ type: 'Terminate' }));
         assemblyWs.close();
       } catch (error) {
@@ -247,7 +257,7 @@ app.post('/api/summarize', async (req, res) => {
       return res.status(400).json({ error: 'No text provided for summarization' });
     }
 
-    const summary = generateSummary(text);
+    const summary = generateAdvancedSummary(text);
     res.json({ summary });
   } catch (error) {
     console.error('Summarization error:', error);
@@ -264,7 +274,7 @@ app.post('/api/enhance-notes', async (req, res) => {
       return res.status(400).json({ error: 'Both existing notes and transcription are required' });
     }
 
-    const enhancedNotes = enhanceNotes(existingNotes, transcription);
+    const enhancedNotes = generateEnhancedNotes(existingNotes, transcription);
     res.json({ enhancedNotes });
   } catch (error) {
     console.error('Note enhancement error:', error);
@@ -280,8 +290,6 @@ app.post('/api/upload-document', upload.single('document'), async (req, res) => 
     }
 
     const content = fs.readFileSync(req.file.path, 'utf-8');
-
-    // Clean up uploaded file
     fs.unlinkSync(req.file.path);
 
     res.json({
@@ -294,303 +302,358 @@ app.post('/api/upload-document', upload.single('document'), async (req, res) => 
   }
 });
 
-// Use AssemblyAI's LeMUR for AI-powered summarization
-app.post('/api/ai-summarize', async (req, res) => {
-  try {
-    const { text } = req.body;
+// ============================================
+// ADVANCED SUMMARIZATION ALGORITHM
+// ============================================
 
-    if (!text || text.trim().length === 0) {
-      return res.status(400).json({ error: 'No text provided for summarization' });
+// Stop words for text processing
+const STOP_WORDS = new Set([
+  'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours',
+  'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself',
+  'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 'what', 'which',
+  'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be',
+  'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an',
+  'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by',
+  'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before',
+  'after', 'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over',
+  'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why',
+  'how', 'all', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not',
+  'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just',
+  'don', 'should', 'now', 'd', 'll', 'm', 'o', 're', 've', 'y', 'ain', 'aren', 'couldn',
+  'didn', 'doesn', 'hadn', 'hasn', 'haven', 'isn', 'ma', 'mightn', 'mustn', 'needn',
+  'shan', 'shouldn', 'wasn', 'weren', 'won', 'wouldn', 'um', 'uh', 'like', 'know', 'yeah',
+  'okay', 'ok', 'right', 'well', 'going', 'got', 'get', 'thing', 'things', 'way', 'would',
+  'could', 'also', 'really', 'actually', 'basically', 'just', 'think', 'something', 'kind'
+]);
+
+// Tokenize text into words
+function tokenize(text) {
+  return text.toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(word => word.length > 1);
+}
+
+// Get content words (excluding stop words)
+function getContentWords(text) {
+  return tokenize(text).filter(word => !STOP_WORDS.has(word) && word.length > 2);
+}
+
+// Split text into sentences (handles unpunctuated text)
+function splitIntoSentences(text) {
+  // First try standard sentence splitting
+  let sentences = text
+    .replace(/([.!?])\s+/g, '$1|||')
+    .split('|||')
+    .map(s => s.trim())
+    .filter(s => s.length > 10);
+
+  // If we got very few sentences, the text might be unpunctuated
+  if (sentences.length < 3 && text.length > 100) {
+    // Split by natural pauses: commas, 'and', 'but', 'so', 'because', etc.
+    sentences = text
+      .replace(/,\s+/g, '|||')
+      .replace(/\s+(and|but|so|because|however|therefore|then|also)\s+/gi, '|||$1 ')
+      .split('|||')
+      .map(s => s.trim())
+      .filter(s => s.length > 15);
+  }
+
+  // If still too few, split by word count
+  if (sentences.length < 3 && text.length > 100) {
+    const words = text.split(/\s+/);
+    sentences = [];
+    for (let i = 0; i < words.length; i += 15) {
+      const chunk = words.slice(i, i + 15).join(' ');
+      if (chunk.length > 15) {
+        sentences.push(chunk);
+      }
     }
-
-    // First, we need to create a transcript to use LeMUR
-    // For direct text summarization, we'll use the local algorithm
-    // LeMUR requires a transcript_id from a completed transcription
-
-    const summary = generateSummary(text);
-    res.json({ summary });
-  } catch (error) {
-    console.error('AI Summarization error:', error);
-    res.status(500).json({ error: 'Failed to generate AI summary' });
   }
-});
 
-// Summarization Algorithm - improved for live transcription
-function generateSummary(text) {
+  return sentences;
+}
+
+// Calculate TF-IDF scores for words
+function calculateTFIDF(sentences) {
+  const wordDocFreq = new Map(); // How many sentences contain each word
+  const sentenceWordFreq = []; // Word frequencies per sentence
+
+  // Calculate document frequencies
+  sentences.forEach((sentence, idx) => {
+    const words = getContentWords(sentence);
+    const wordSet = new Set(words);
+    const wordFreq = new Map();
+
+    words.forEach(word => {
+      wordFreq.set(word, (wordFreq.get(word) || 0) + 1);
+    });
+
+    wordSet.forEach(word => {
+      wordDocFreq.set(word, (wordDocFreq.get(word) || 0) + 1);
+    });
+
+    sentenceWordFreq.push(wordFreq);
+  });
+
+  // Calculate TF-IDF for each sentence
+  const numDocs = sentences.length;
+  const sentenceScores = sentences.map((sentence, idx) => {
+    const wordFreq = sentenceWordFreq[idx];
+    let score = 0;
+    const words = getContentWords(sentence);
+    const maxFreq = Math.max(...wordFreq.values(), 1);
+
+    words.forEach(word => {
+      const tf = (wordFreq.get(word) || 0) / maxFreq;
+      const idf = Math.log(numDocs / (wordDocFreq.get(word) || 1));
+      score += tf * idf;
+    });
+
+    // Normalize by sentence length
+    return score / Math.sqrt(words.length || 1);
+  });
+
+  return sentenceScores;
+}
+
+// Generate advanced summary using extractive summarization
+function generateAdvancedSummary(text) {
   if (!text || text.trim().length === 0) {
-    return { keyPoints: [], summary: '', actionItems: [] };
+    return { keyPoints: [], summary: '', actionItems: [], wordCount: 0, sentenceCount: 0 };
   }
 
-  // Clean and normalize text
   const cleanText = text.trim();
   const words = cleanText.split(/\s+/);
   const wordCount = words.length;
 
-  // Split into segments (handle both punctuated and unpunctuated text)
-  let segments = [];
-
-  // First try splitting by punctuation
-  const punctuatedSegments = cleanText
-    .split(/[.!?]+/)
-    .map(s => s.trim())
-    .filter(s => s.length > 15);
-
-  if (punctuatedSegments.length >= 3) {
-    segments = punctuatedSegments;
-  } else {
-    // For unpunctuated text, split by word chunks or natural pauses
-    // Split into chunks of roughly 15-25 words
-    const chunkSize = 20;
-    for (let i = 0; i < words.length; i += chunkSize) {
-      const chunk = words.slice(i, Math.min(i + chunkSize, words.length)).join(' ');
-      if (chunk.length > 15) {
-        segments.push(chunk);
-      }
-    }
+  // If text is very short, return as-is
+  if (wordCount < 30) {
+    return {
+      keyPoints: [cleanText],
+      summary: cleanText,
+      actionItems: [],
+      wordCount,
+      sentenceCount: 1
+    };
   }
 
-  // Keywords for categorization
-  const actionKeywords = ['need', 'must', 'should', 'have to', 'going to', 'will', 'plan', 'todo', 'task', 'action', 'deadline', 'complete', 'finish', 'start', 'begin', 'make sure', 'don\'t forget', 'remember to'];
-  const importantKeywords = ['important', 'key', 'main', 'critical', 'essential', 'priority', 'focus', 'goal', 'objective', 'significant', 'crucial', 'note that', 'keep in mind', 'basically', 'essentially', 'the point is', 'in summary', 'to summarize', 'conclusion', 'decided', 'agreed'];
+  const sentences = splitIntoSentences(cleanText);
+  const sentenceCount = sentences.length;
 
-  const keyPoints = [];
-  const actionItems = [];
-  const topicSentences = [];
+  // Calculate TF-IDF scores
+  const tfidfScores = calculateTFIDF(sentences);
 
-  segments.forEach((segment, index) => {
-    const lowerSegment = segment.toLowerCase();
-
-    // Check for action items
-    const isAction = actionKeywords.some(kw => lowerSegment.includes(kw));
-    if (isAction) {
-      actionItems.push(segment);
-    }
-
-    // Check for important points
-    const isImportant = importantKeywords.some(kw => lowerSegment.includes(kw));
-    if (isImportant) {
-      keyPoints.push(segment);
-    }
-
-    // First segment often introduces the topic
-    if (index === 0 && segment.length > 20) {
-      topicSentences.push(segment);
-    }
+  // Calculate position scores (first and last sentences are often important)
+  const positionScores = sentences.map((_, idx) => {
+    if (idx === 0) return 1.5; // First sentence bonus
+    if (idx === sentences.length - 1) return 1.2; // Last sentence bonus
+    if (idx < sentences.length * 0.2) return 1.1; // Early sentences
+    return 1.0;
   });
 
-  // If no key points found, extract the most informative segments
-  if (keyPoints.length === 0 && segments.length > 0) {
-    // Take first, middle, and last segments as representative
-    keyPoints.push(segments[0]);
-    if (segments.length > 2) {
-      keyPoints.push(segments[Math.floor(segments.length / 2)]);
-    }
-    if (segments.length > 1) {
-      keyPoints.push(segments[segments.length - 1]);
-    }
+  // Look for sentences with important keywords
+  const importantPatterns = [
+    /\b(important|key|main|critical|essential|significant|crucial)\b/i,
+    /\b(conclusion|summary|result|finding|決定|決めた)\b/i,
+    /\b(must|need to|have to|should|required|necessary)\b/i,
+    /\b(goal|objective|purpose|aim|target)\b/i,
+    /\b(problem|issue|challenge|solution|resolve)\b/i,
+    /\b(first|second|third|finally|lastly|in conclusion)\b/i
+  ];
+
+  const keywordScores = sentences.map(sentence => {
+    let score = 1.0;
+    importantPatterns.forEach(pattern => {
+      if (pattern.test(sentence)) score += 0.3;
+    });
+    return score;
+  });
+
+  // Combine scores
+  const combinedScores = sentences.map((sentence, idx) => ({
+    sentence,
+    index: idx,
+    score: tfidfScores[idx] * positionScores[idx] * keywordScores[idx],
+    isAction: /\b(need to|have to|must|should|will|going to|plan to|todo|task|action|deadline|by|until|before)\b/i.test(sentence)
+  }));
+
+  // Sort by score
+  const rankedSentences = [...combinedScores].sort((a, b) => b.score - a.score);
+
+  // Select top sentences for summary (aim for ~30% compression or max 5 sentences)
+  const targetSentences = Math.min(Math.max(2, Math.ceil(sentenceCount * 0.3)), 5);
+  const selectedIndices = new Set();
+  const summaryParts = [];
+
+  for (const item of rankedSentences) {
+    if (summaryParts.length >= targetSentences) break;
+    selectedIndices.add(item.index);
+    summaryParts.push({ index: item.index, sentence: item.sentence });
   }
 
-  // Generate a condensed summary
-  let summary = '';
-  const targetSummaryLength = Math.min(150, Math.floor(wordCount * 0.3)); // ~30% of original or 150 words max
+  // Sort selected sentences by original order for coherent reading
+  summaryParts.sort((a, b) => a.index - b.index);
+  const summary = summaryParts.map(p => p.sentence).join('. ').replace(/\.\./g, '.');
 
-  // Build summary from key points and topic sentences
-  const summarySource = [...new Set([...topicSentences, ...keyPoints.slice(0, 3)])];
+  // Extract key points (top scored sentences not in summary)
+  const keyPoints = rankedSentences
+    .filter(item => !selectedIndices.has(item.index))
+    .slice(0, 5)
+    .map(item => item.sentence);
 
-  if (summarySource.length > 0) {
-    let summaryWords = [];
-    for (const segment of summarySource) {
-      const segmentWords = segment.split(/\s+/);
-      if (summaryWords.length + segmentWords.length <= targetSummaryLength) {
-        summaryWords = summaryWords.concat(segmentWords);
-      } else {
-        // Add partial segment to reach target
-        const remaining = targetSummaryLength - summaryWords.length;
-        if (remaining > 5) {
-          summaryWords = summaryWords.concat(segmentWords.slice(0, remaining));
-        }
-        break;
+  // Add summary sentences as key points if we don't have enough
+  if (keyPoints.length < 3) {
+    summaryParts.forEach(p => {
+      if (keyPoints.length < 5 && !keyPoints.includes(p.sentence)) {
+        keyPoints.push(p.sentence);
       }
-    }
-    summary = summaryWords.join(' ');
-    if (summary.length > 0 && !summary.match(/[.!?]$/)) {
-      summary += '.';
-    }
-  } else {
-    // Fallback: take first portion of text
-    summary = words.slice(0, Math.min(targetSummaryLength, words.length)).join(' ');
-    if (!summary.match(/[.!?]$/)) {
-      summary += '...';
-    }
+    });
   }
 
-  // Deduplicate and limit results
-  const uniqueKeyPoints = [...new Set(keyPoints)].slice(0, 5);
-  const uniqueActionItems = [...new Set(actionItems)].slice(0, 5);
+  // Extract action items
+  const actionItems = combinedScores
+    .filter(item => item.isAction)
+    .slice(0, 5)
+    .map(item => item.sentence);
 
   return {
-    keyPoints: uniqueKeyPoints,
-    summary: summary,
-    actionItems: uniqueActionItems,
-    wordCount: wordCount,
-    sentenceCount: segments.length,
-    compressionRatio: summary.split(/\s+/).length / wordCount
+    keyPoints,
+    summary: summary || cleanText.substring(0, 200) + '...',
+    actionItems,
+    wordCount,
+    sentenceCount,
+    compressionRatio: Math.round((summary.split(/\s+/).length / wordCount) * 100)
   };
 }
 
-// Note Enhancement Algorithm - improved for better results
-function enhanceNotes(existingNotes, transcription) {
-  // Parse existing notes
-  const existingLines = existingNotes
+// ============================================
+// ENHANCED NOTES ALGORITHM
+// ============================================
+
+function generateEnhancedNotes(existingNotes, transcription) {
+  // Parse existing notes into lines
+  const noteLines = existingNotes
     .split('\n')
     .map(line => line.trim())
     .filter(line => line.length > 0);
 
-  // Generate summary of transcription
-  const transcriptionSummary = generateSummary(transcription);
-
-  // Extract key topics/words from existing notes (excluding common words)
-  const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'between', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because', 'until', 'while', 'this', 'that', 'these', 'those', 'what', 'which', 'who', 'whom', 'its', 'your', 'their', 'our', 'his', 'her']);
-
-  const existingTopics = new Set();
-  existingLines.forEach(line => {
-    const words = line.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
+  // Extract key topics from existing notes
+  const noteTopics = new Map(); // topic -> count
+  noteLines.forEach(line => {
+    const words = getContentWords(line);
     words.forEach(word => {
-      if (word.length > 3 && !stopWords.has(word)) {
-        existingTopics.add(word);
+      if (word.length > 3) {
+        noteTopics.set(word, (noteTopics.get(word) || 0) + 1);
       }
     });
   });
 
-  // Split transcription into segments
-  let transcriptionSegments = [];
-  const cleanTranscription = transcription.trim();
+  // Get top topics from notes
+  const topTopics = new Set(
+    Array.from(noteTopics.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([word]) => word)
+  );
 
-  // Try punctuation-based splitting first
-  const punctuatedSegments = cleanTranscription
-    .split(/[.!?]+/)
-    .map(s => s.trim())
-    .filter(s => s.length > 10);
+  // Process transcription
+  const transcriptSentences = splitIntoSentences(transcription);
+  const transcriptSummary = generateAdvancedSummary(transcription);
 
-  if (punctuatedSegments.length >= 2) {
-    transcriptionSegments = punctuatedSegments;
-  } else {
-    // Split by word chunks for unpunctuated text
-    const words = cleanTranscription.split(/\s+/);
-    const chunkSize = 25;
-    for (let i = 0; i < words.length; i += chunkSize) {
-      const chunk = words.slice(i, Math.min(i + chunkSize, words.length)).join(' ');
-      if (chunk.length > 10) {
-        transcriptionSegments.push(chunk);
-      }
-    }
-  }
+  // Find sentences that relate to note topics
+  const relatedInfo = [];
+  const newInfo = [];
 
-  // Find new information related to existing topics
-  const newInformation = [];
-  const usedSegments = new Set();
+  transcriptSentences.forEach(sentence => {
+    const sentenceWords = new Set(getContentWords(sentence));
+    const matchingTopics = [...sentenceWords].filter(word => topTopics.has(word));
 
-  transcriptionSegments.forEach(segment => {
-    const segmentWords = segment.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
-    const matchingTopics = segmentWords.filter(word => existingTopics.has(word));
+    // Check similarity with existing notes
+    const isDuplicate = noteLines.some(line => {
+      const similarity = jaccardSimilarity(
+        new Set(getContentWords(line)),
+        sentenceWords
+      );
+      return similarity > 0.4;
+    });
 
-    // If segment relates to existing topics
-    if (matchingTopics.length >= 1) {
-      // Check if this is substantially different from existing notes
-      const isDuplicate = existingLines.some(line => {
-        const similarity = calculateSimilarity(line.toLowerCase(), segment.toLowerCase());
-        return similarity > 0.5;
-      });
-
-      if (!isDuplicate && !usedSegments.has(segment)) {
-        newInformation.push(segment);
-        usedSegments.add(segment);
+    if (!isDuplicate && sentence.length > 20) {
+      if (matchingTopics.length >= 1) {
+        relatedInfo.push({ sentence, matchCount: matchingTopics.length, topics: matchingTopics });
+      } else {
+        newInfo.push(sentence);
       }
     }
   });
 
-  // Also include segments that might be new topics not in original notes
-  const additionalInfo = [];
-  transcriptionSegments.forEach(segment => {
-    if (!usedSegments.has(segment)) {
-      const isDuplicate = existingLines.some(line => {
-        const similarity = calculateSimilarity(line.toLowerCase(), segment.toLowerCase());
-        return similarity > 0.4;
-      });
-      if (!isDuplicate) {
-        additionalInfo.push(segment);
-        usedSegments.add(segment);
-      }
-    }
-  });
+  // Sort related info by relevance
+  relatedInfo.sort((a, b) => b.matchCount - a.matchCount);
 
-  // Build enhanced notes document
-  let enhancedNotes = '# Enhanced Notes\n\n';
+  // Build enhanced document
+  let enhanced = '# Enhanced Notes\n\n';
 
-  // Original notes section
-  enhancedNotes += '## Original Notes\n';
-  existingLines.forEach(line => {
-    // Preserve original formatting if it looks like a list item
-    if (line.startsWith('-') || line.startsWith('*') || line.match(/^\d+\./)) {
-      enhancedNotes += line + '\n';
+  // Original notes
+  enhanced += '## Original Notes\n';
+  noteLines.forEach(line => {
+    if (line.startsWith('-') || line.startsWith('*') || /^\d+\./.test(line)) {
+      enhanced += line + '\n';
     } else {
-      enhancedNotes += '- ' + line + '\n';
+      enhanced += '- ' + line + '\n';
     }
   });
-  enhancedNotes += '\n';
+  enhanced += '\n';
 
-  // Related information from recording
-  if (newInformation.length > 0) {
-    enhancedNotes += '## Related Details from Recording\n';
-    newInformation.slice(0, 8).forEach(info => {
-      enhancedNotes += '- ' + info + '\n';
+  // Expanded details from recording (related to your notes)
+  if (relatedInfo.length > 0) {
+    enhanced += '## Expanded Details from Recording\n';
+    enhanced += '_Information from the recording that relates to your notes:_\n\n';
+    relatedInfo.slice(0, 6).forEach(item => {
+      enhanced += '- ' + item.sentence + '\n';
     });
-    enhancedNotes += '\n';
+    enhanced += '\n';
   }
 
-  // Additional new information
-  if (additionalInfo.length > 0) {
-    enhancedNotes += '## Additional Information\n';
-    additionalInfo.slice(0, 5).forEach(info => {
-      enhancedNotes += '- ' + info + '\n';
+  // New topics from recording
+  if (newInfo.length > 0) {
+    enhanced += '## New Information from Recording\n';
+    enhanced += '_Additional topics discussed that weren\'t in your original notes:_\n\n';
+    newInfo.slice(0, 5).forEach(sentence => {
+      enhanced += '- ' + sentence + '\n';
     });
-    enhancedNotes += '\n';
+    enhanced += '\n';
   }
 
-  // Key points from transcription
-  if (transcriptionSummary.keyPoints.length > 0) {
-    enhancedNotes += '## Key Points\n';
-    transcriptionSummary.keyPoints.forEach(point => {
-      enhancedNotes += '- ' + point + '\n';
+  // Key points
+  if (transcriptSummary.keyPoints.length > 0) {
+    enhanced += '## Key Points\n';
+    transcriptSummary.keyPoints.slice(0, 5).forEach(point => {
+      enhanced += '- ' + point + '\n';
     });
-    enhancedNotes += '\n';
+    enhanced += '\n';
   }
 
   // Action items
-  if (transcriptionSummary.actionItems.length > 0) {
-    enhancedNotes += '## Action Items\n';
-    transcriptionSummary.actionItems.forEach(item => {
-      enhancedNotes += '- [ ] ' + item + '\n';
+  if (transcriptSummary.actionItems.length > 0) {
+    enhanced += '## Action Items\n';
+    transcriptSummary.actionItems.forEach(item => {
+      enhanced += '- [ ] ' + item + '\n';
     });
-    enhancedNotes += '\n';
+    enhanced += '\n';
   }
 
   // Summary
-  enhancedNotes += '## Summary\n';
-  enhancedNotes += transcriptionSummary.summary + '\n';
+  enhanced += '## Recording Summary\n';
+  enhanced += transcriptSummary.summary + '\n';
 
-  return enhancedNotes;
+  return enhanced;
 }
 
-// Simple text similarity calculation (Jaccard similarity)
-function calculateSimilarity(text1, text2) {
-  const words1 = new Set(text1.split(/\s+/).filter(w => w.length > 2));
-  const words2 = new Set(text2.split(/\s+/).filter(w => w.length > 2));
-
-  const intersection = new Set([...words1].filter(x => words2.has(x)));
-  const union = new Set([...words1, ...words2]);
-
-  return intersection.size / union.size;
+// Jaccard similarity between two sets
+function jaccardSimilarity(set1, set2) {
+  const intersection = new Set([...set1].filter(x => set2.has(x)));
+  const union = new Set([...set1, ...set2]);
+  return union.size > 0 ? intersection.size / union.size : 0;
 }
 
 // Start server
