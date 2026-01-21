@@ -25,9 +25,14 @@ function App() {
     setNotifications(prev => prev.filter(n => n.id !== id));
   }, []);
 
-  const handleTranscriptUpdate = useCallback((text, isFinal) => {
+  const handleTranscriptUpdate = useCallback((text, isFinal, fullTranscript) => {
     if (isFinal) {
-      setTranscript(prev => prev + (prev ? ' ' : '') + text);
+      // Use fullTranscript from Universal Streaming v3 API if available
+      if (fullTranscript) {
+        setTranscript(fullTranscript);
+      } else {
+        setTranscript(prev => prev + (prev ? ' ' : '') + text);
+      }
       setPartialTranscript('');
     } else {
       setPartialTranscript(text);

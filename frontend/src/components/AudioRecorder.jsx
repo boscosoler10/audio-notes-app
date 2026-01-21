@@ -85,10 +85,11 @@ function AudioRecorder({
               console.log('Transcription session started:', data.sessionId);
               break;
             case 'partial_transcript':
-              onTranscriptUpdate(data.text, false);
+              onTranscriptUpdate(data.text, false, null);
               break;
             case 'final_transcript':
-              onTranscriptUpdate(data.text, true);
+              // Pass fullTranscript from Universal Streaming v3 API
+              onTranscriptUpdate(data.text, true, data.fullTranscript);
               break;
             case 'session_end':
               console.log('Transcription session ended');
